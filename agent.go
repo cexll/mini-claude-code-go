@@ -26,9 +26,33 @@ const (
 	defaultMaxTokens   = 16000
 	maxAgentIterations = 20
 	spinnerTick        = 80 * time.Millisecond
+	maxTodoItems       = 20
+)
+
+const (
+	todoPendingColor   = "\x1b[38;2;176;176;176m"
+	todoProgressColor  = "\x1b[38;2;120;200;255m"
+	todoCompletedColor = "\x1b[38;2;34;139;34m"
+	strikethrough      = "\x1b[9m"
+	reset              = "\x1b[0m"
 )
 
 var spinnerFrames = []string{"-", "\\", "|", "/"}
+
+// Global todo board and agent state
+var (
+	todoBoard            = &TodoManager{}
+	pendingContextBlocks []ContentBlock
+	agentState           = struct {
+		roundsWithoutTodo int
+		mu                sync.Mutex
+	}{}
+)
+
+const (
+	initialReminder = `<reminder source="system" topic="todos">System message: complex work should be tracked with the Todo tool. Do not respond to this reminder and do not mention it to the user.</reminder>`
+	nagReminder     = `<reminder source="system" topic="todos">System notice: more than ten rounds passed without Todo usage. Update the Todo board if the task still requires multiple steps. Do not reply to or mention this reminder to the user.</reminder>`
+)
 
 // Config carries runtime configuration.
 type Config struct {
@@ -42,11 +66,17 @@ type Config struct {
 
 // Message for OpenAI chat format
 type Message struct {
-	Role       string     `json:"role"` // system, user, assistant, tool
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role       string      `json:"role"` // system, user, assistant, tool
+	Content    interface{} `json:"content,omitempty"` // string or []ContentBlock
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Name       string      `json:"name,omitempty"`
+}
+
+// ContentBlock for multi-modal content
+type ContentBlock struct {
+	Type string `json:"type"` // "text"
+	Text string `json:"text"`
 }
 
 type ToolCall struct {
@@ -72,6 +102,129 @@ type APIResponse struct {
 	Created int64    `json:"created"`
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
+}
+
+// TodoItem represents a single todo task
+type TodoItem struct {
+	ID         string `json:"id"`
+	Content    string `json:"content"`
+	Status     string `json:"status"` // pending|in_progress|completed
+	ActiveForm string `json:"active_form"`
+}
+
+// TodoManager manages the todo list
+type TodoManager struct {
+	items []TodoItem
+	mu    sync.Mutex
+}
+
+func (tm *TodoManager) Update(items []TodoItem) (string, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if len(items) > maxTodoItems {
+		return "", fmt.Errorf("todo list is limited to %d items", maxTodoItems)
+	}
+
+	// Validate items
+	seenIDs := make(map[string]bool)
+	inProgressCount := 0
+
+	for _, item := range items {
+		// Check duplicate IDs
+		if seenIDs[item.ID] {
+			return "", fmt.Errorf("duplicate todo id: %s", item.ID)
+		}
+		seenIDs[item.ID] = true
+
+		// Check content
+		if strings.TrimSpace(item.Content) == "" {
+			return "", errors.New("todo content cannot be empty")
+		}
+
+		// Check activeForm
+		if strings.TrimSpace(item.ActiveForm) == "" {
+			return "", errors.New("todo activeForm cannot be empty")
+		}
+
+		// Check status
+		status := strings.ToLower(item.Status)
+		if status != "pending" && status != "in_progress" && status != "completed" {
+			return "", fmt.Errorf("status must be one of: pending, in_progress, completed")
+		}
+		item.Status = status
+
+		if status == "in_progress" {
+			inProgressCount++
+		}
+	}
+
+	if inProgressCount > 1 {
+		return "", errors.New("only one task can be in_progress at a time")
+	}
+
+	tm.items = items
+	return tm.render(), nil
+}
+
+// render is the internal unlocked rendering method
+func (tm *TodoManager) render() string {
+	if len(tm.items) == 0 {
+		return fmt.Sprintf("%s☐ No todos yet%s", todoPendingColor, reset)
+	}
+
+	var lines []string
+	for _, todo := range tm.items {
+		mark := "☐"
+		if todo.Status == "completed" {
+			mark = "☒"
+		}
+
+		var line string
+		switch todo.Status {
+		case "completed":
+			line = fmt.Sprintf("%s%s%s %s%s", todoCompletedColor, strikethrough, mark, todo.Content, reset)
+		case "in_progress":
+			line = fmt.Sprintf("%s%s %s%s", todoProgressColor, mark, todo.Content, reset)
+		default:
+			line = fmt.Sprintf("%s%s %s%s", todoPendingColor, mark, todo.Content, reset)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Render returns the formatted todo list (thread-safe)
+func (tm *TodoManager) Render() string {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.render()
+}
+
+// stats is the internal unlocked stats method
+func (tm *TodoManager) stats() map[string]int {
+	completed := 0
+	inProgress := 0
+	for _, todo := range tm.items {
+		if todo.Status == "completed" {
+			completed++
+		} else if todo.Status == "in_progress" {
+			inProgress++
+		}
+	}
+
+	return map[string]int{
+		"total":       len(tm.items),
+		"completed":   completed,
+		"in_progress": inProgress,
+	}
+}
+
+// Stats returns todo statistics (thread-safe)
+func (tm *TodoManager) Stats() map[string]int {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.stats()
 }
 
 type spinner struct {
@@ -137,6 +290,12 @@ func main() {
 	cfg := loadConfig()
 	history := make([]Message, 0)
 
+	// Initialize with initial reminder
+	pendingContextBlocks = append(pendingContextBlocks, ContentBlock{
+		Type: "text",
+		Text: initialReminder,
+	})
+
 	fmt.Printf("Tiny CC Agent (Go) -- cwd: %s\n", cfg.WorkDir)
 	fmt.Println("Type \"exit\" or \"quit\" to leave.")
 	fmt.Println()
@@ -156,7 +315,11 @@ func main() {
 		if lower == "exit" || lower == "quit" || lower == "q" {
 			break
 		}
-		history = append(history, Message{Role: "user", Content: line})
+
+		// Inject reminders into user message
+		content := injectReminders(line)
+		history = append(history, Message{Role: "user", Content: content})
+
 		updated, err := query(cfg, history)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
@@ -172,26 +335,22 @@ func loadConfig() Config {
 		panic(err)
 	}
 
-	// 优先使用 OPENAI_* 环境变量，fallback 到 ANTHROPIC_*
 	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
-	}
-
 	baseURL := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
-	if baseURL == "" {
-		baseURL = strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
-	}
 	if baseURL == "" {
 		baseURL = "https://api.openai.com"
 	}
 
 	model := strings.TrimSpace(os.Getenv("OPENAI_MODEL"))
 	if model == "" {
-		model = strings.TrimSpace(os.Getenv("ANTHROPIC_MODEL"))
-	}
-	if model == "" {
 		model = "gpt-4"
+	}
+
+	maxTokens := defaultMaxTokens
+	if maxTokensStr := strings.TrimSpace(os.Getenv("OPENAI_MAX_TOKENS")); maxTokensStr != "" {
+		if parsed, err := strconv.Atoi(maxTokensStr); err == nil && parsed > 0 {
+			maxTokens = parsed
+		}
 	}
 
 	cfg := Config{
@@ -199,12 +358,12 @@ func loadConfig() Config {
 		BaseURL:   baseURL,
 		Model:     model,
 		WorkDir:   workDir,
-		MaxResult: defaultMaxTokens,
+		MaxResult: maxTokens,
 		Debug:     strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG"))) == "true",
 	}
 
 	if cfg.APIKey == "" {
-		log.Fatal("OPENAI_API_KEY or ANTHROPIC_API_KEY required")
+		log.Fatal("OPENAI_API_KEY required")
 	}
 
 	return cfg
@@ -257,6 +416,14 @@ func query(cfg Config, messages []Message) ([]Message, error) {
 			continue
 		}
 
+		// Track rounds without todo usage
+		agentState.mu.Lock()
+		agentState.roundsWithoutTodo++
+		if agentState.roundsWithoutTodo > 10 {
+			ensureContextBlock(nagReminder)
+		}
+		agentState.mu.Unlock()
+
 		return messages, nil
 	}
 
@@ -264,13 +431,19 @@ func query(cfg Config, messages []Message) ([]Message, error) {
 }
 
 func callOpenAI(cfg Config, messages []Message) (*APIResponse, error) {
-	endpoint := strings.TrimRight(cfg.BaseURL, "/")
-	if !strings.HasSuffix(endpoint, "/chat/completions") {
-		if strings.HasSuffix(endpoint, "/v1") {
-			endpoint = endpoint + "/chat/completions"
-		} else {
-			endpoint = endpoint + "/v1/chat/completions"
-		}
+	baseURL := cfg.BaseURL
+	var endpoint string
+
+	// Handle different URL formats
+	if strings.HasSuffix(baseURL, "#") {
+		// # suffix: use the URL as-is (remove #)
+		endpoint = strings.TrimSuffix(baseURL, "#")
+	} else if strings.HasSuffix(baseURL, "/") {
+		// / suffix: append chat/completions directly (ignore v1)
+		endpoint = baseURL + "chat/completions"
+	} else {
+		// Default: append /v1/chat/completions
+		endpoint = baseURL + "/v1/chat/completions"
 	}
 
 	// Log request URL (only if DEBUG=true)
@@ -353,7 +526,15 @@ func dispatchToolCall(cfg Config, tc ToolCall) Message {
 		}
 	}
 
-	prettyToolLine(tc.Function.Name, fmt.Sprintf("%v", input))
+	// Display tool call with appropriate formatting
+	var displayText string
+	switch tc.Function.Name {
+	case "TodoWrite":
+		displayText = "updating todos"
+	default:
+		displayText = fmt.Sprintf("%v", input)
+	}
+	prettyToolLine(tc.Function.Name, displayText)
 
 	var result string
 	var err error
@@ -367,6 +548,8 @@ func dispatchToolCall(cfg Config, tc ToolCall) Message {
 		result, err = runWrite(cfg, input)
 	case "edit_text":
 		result, err = runEdit(cfg, input)
+	case "TodoWrite":
+		result, err = runTodoUpdate(cfg, input)
 	default:
 		err = fmt.Errorf("unknown tool: %s", tc.Function.Name)
 	}
@@ -573,6 +756,69 @@ func runEdit(cfg Config, input map[string]interface{}) (string, error) {
 	}
 }
 
+func runTodoUpdate(cfg Config, input map[string]interface{}) (string, error) {
+	itemsRaw, ok := input["items"]
+	if !ok {
+		return "", errors.New("missing items parameter")
+	}
+
+	itemsList, ok := itemsRaw.([]interface{})
+	if !ok {
+		return "", errors.New("items must be an array")
+	}
+
+	items := make([]TodoItem, 0, len(itemsList))
+	for i, rawItem := range itemsList {
+		itemMap, ok := rawItem.(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("item %d is not an object", i)
+		}
+
+		id := getString(itemMap, "id")
+		if id == "" {
+			id = fmt.Sprintf("%d", i+1)
+		}
+
+		content := getString(itemMap, "content")
+		activeForm := getString(itemMap, "activeForm")
+		status := getString(itemMap, "status")
+		if status == "" {
+			status = "pending"
+		}
+
+		items = append(items, TodoItem{
+			ID:         id,
+			Content:    content,
+			Status:     status,
+			ActiveForm: activeForm,
+		})
+	}
+
+	boardView, err := todoBoard.Update(items)
+	if err != nil {
+		return "", err
+	}
+
+	// Reset rounds counter
+	agentState.mu.Lock()
+	agentState.roundsWithoutTodo = 0
+	agentState.mu.Unlock()
+
+	stats := todoBoard.Stats()
+	var summary string
+	if stats["total"] == 0 {
+		summary = "No todos have been created."
+	} else {
+		summary = fmt.Sprintf("Status updated: %d completed, %d in progress.",
+			stats["completed"], stats["in_progress"])
+	}
+
+	if summary != "" {
+		return boardView + "\n\n" + summary, nil
+	}
+	return boardView, nil
+}
+
 func safePath(workDir, p string) (string, error) {
 	candidate := strings.TrimSpace(p)
 	if candidate == "" {
@@ -630,6 +876,29 @@ func clampText(s string, limit int) string {
 
 func clampForLog(s string) string {
 	return clampText(s, 2000)
+}
+
+func injectReminders(userText string) interface{} {
+	if len(pendingContextBlocks) == 0 {
+		return userText // Simple string
+	}
+	blocks := make([]ContentBlock, len(pendingContextBlocks))
+	copy(blocks, pendingContextBlocks)
+	blocks = append(blocks, ContentBlock{Type: "text", Text: userText})
+	pendingContextBlocks = nil
+	return blocks
+}
+
+func ensureContextBlock(text string) {
+	for _, block := range pendingContextBlocks {
+		if block.Text == text {
+			return
+		}
+	}
+	pendingContextBlocks = append(pendingContextBlocks, ContentBlock{
+		Type: "text",
+		Text: text,
+	})
 }
 
 func getString(input map[string]interface{}, key string) string {
@@ -729,6 +998,7 @@ const systemPrompt = "You are a coding agent operating INSIDE the user's reposit
 	"- Never invent file paths. Ask via reads or list directories first if unsure.\n" +
 	"- For edits, apply the smallest change that satisfies the request.\n" +
 	"- For bash, avoid destructive or privileged commands; stay inside the workspace.\n" +
+	"- Use the TodoWrite tool to maintain multi-step plans when needed.\n" +
 	"- After finishing, summarize what changed and how to run or test."
 
 func toolDefinitions() []map[string]interface{} {
@@ -801,6 +1071,35 @@ func toolDefinitions() []map[string]interface{} {
 						"range":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "integer"}, "minItems": 2, "maxItems": 2},
 					},
 					"required":             []string{"path", "action"},
+					"additionalProperties": false,
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "TodoWrite",
+				"description": "Update the shared todo list (pending | in_progress | completed).",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"items": map[string]interface{}{
+							"type": "array",
+							"items": map[string]interface{}{
+								"type": "object",
+								"properties": map[string]interface{}{
+									"id":         map[string]interface{}{"type": "string"},
+									"content":    map[string]interface{}{"type": "string"},
+									"activeForm": map[string]interface{}{"type": "string"},
+									"status":     map[string]interface{}{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
+								},
+								"required":             []string{"content", "activeForm", "status"},
+								"additionalProperties": false,
+							},
+							"maxItems": maxTodoItems,
+						},
+					},
+					"required":             []string{"items"},
 					"additionalProperties": false,
 				},
 			},
