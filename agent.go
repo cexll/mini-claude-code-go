@@ -23,7 +23,7 @@ import (
 
 const (
 	maxToolResultChars = 100000
-	defaultMaxTokens   = 16000
+	defaultMaxTokens   = 8192
 	maxAgentIterations = 20
 	spinnerTick        = 80 * time.Millisecond
 	maxTodoItems       = 20
@@ -62,6 +62,7 @@ type Config struct {
 	WorkDir   string
 	MaxResult int
 	Debug     bool
+	Stream    bool
 }
 
 // Message for OpenAI chat format
@@ -360,6 +361,7 @@ func loadConfig() Config {
 		WorkDir:   workDir,
 		MaxResult: maxTokens,
 		Debug:     strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG"))) == "true",
+		Stream:    strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_STREAM"))) != "false",
 	}
 
 	if cfg.APIKey == "" {
@@ -438,6 +440,9 @@ func callOpenAI(cfg Config, messages []Message) (*APIResponse, error) {
 	if strings.HasSuffix(baseURL, "#") {
 		// # suffix: use the URL as-is (remove #)
 		endpoint = strings.TrimSuffix(baseURL, "#")
+	} else if strings.HasSuffix(baseURL, "/v1") {
+		// Base URL already ends with /v1: append /chat/completions
+		endpoint = baseURL + "/chat/completions"
 	} else if strings.HasSuffix(baseURL, "/") {
 		// / suffix: append chat/completions directly (ignore v1)
 		endpoint = baseURL + "chat/completions"
@@ -456,6 +461,7 @@ func callOpenAI(cfg Config, messages []Message) (*APIResponse, error) {
 		"messages":   messages,
 		"tools":      toolDefinitions(),
 		"max_tokens": cfg.MaxResult,
+		"stream":     cfg.Stream,
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -479,6 +485,17 @@ func callOpenAI(cfg Config, messages []Message) (*APIResponse, error) {
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
+	// Log request headers (only if DEBUG=true)
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Request Headers:\n")
+		for key, values := range req.Header {
+			for _, value := range values {
+				fmt.Fprintf(os.Stderr, "  %s: %s\n", key, value)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -486,32 +503,13 @@ func callOpenAI(cfg Config, messages []Message) (*APIResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read response body
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	// Handle streaming response
+	if cfg.Stream {
+		return handleStreamingResponse(cfg, resp)
 	}
 
-	// Log response (only if DEBUG=true)
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "[DEBUG] Response Status: %d %s\n", resp.StatusCode, resp.Status)
-		var prettyResp bytes.Buffer
-		if err := json.Indent(&prettyResp, data, "", "  "); err == nil {
-			fmt.Fprintf(os.Stderr, "[DEBUG] Response Body:\n%s\n\n", prettyResp.String())
-		} else {
-			fmt.Fprintf(os.Stderr, "[DEBUG] Response Body (raw):\n%s\n\n", clampForLog(string(data)))
-		}
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("api error: status %d body %s", resp.StatusCode, clampForLog(string(data)))
-	}
-
-	var apiResp APIResponse
-	if err := json.Unmarshal(data, &apiResp); err != nil {
-		return nil, err
-	}
-	return &apiResp, nil
+	// Handle non-streaming response
+	return handleNonStreamingResponse(cfg, resp)
 }
 
 func dispatchToolCall(cfg Config, tc ToolCall) Message {
@@ -1105,4 +1103,130 @@ func toolDefinitions() []map[string]interface{} {
 			},
 		},
 	}
+}
+
+// handleNonStreamingResponse processes standard JSON responses
+func handleNonStreamingResponse(cfg Config, resp *http.Response) (*APIResponse, error) {
+	// Read response body
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Log response (only if DEBUG=true)
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Response Status: %d %s\n", resp.StatusCode, resp.Status)
+		fmt.Fprintf(os.Stderr, "[DEBUG] Response Headers:\n")
+		for key, values := range resp.Header {
+			for _, value := range values {
+				fmt.Fprintf(os.Stderr, "  %s: %s\n", key, value)
+			}
+		}
+		var prettyResp bytes.Buffer
+		if err := json.Indent(&prettyResp, data, "", "  "); err == nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG] Response Body:\n%s\n\n", prettyResp.String())
+		} else {
+			fmt.Fprintf(os.Stderr, "[DEBUG] Response Body (raw):\n%s\n\n", clampForLog(string(data)))
+		}
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("api error: status %d body %s", resp.StatusCode, clampForLog(string(data)))
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(data, &apiResp); err != nil {
+		return nil, err
+	}
+	return &apiResp, nil
+}
+
+// handleStreamingResponse processes Server-Sent Events (SSE) stream responses
+func handleStreamingResponse(cfg Config, resp *http.Response) (*APIResponse, error) {
+	// Log response headers (only if DEBUG=true)
+	if cfg.Debug {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Response Status: %d %s\n", resp.StatusCode, resp.Status)
+		fmt.Fprintf(os.Stderr, "[DEBUG] Response Headers:\n")
+		for key, values := range resp.Header {
+			for _, value := range values {
+				fmt.Fprintf(os.Stderr, "  %s: %s\n", key, value)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "[DEBUG] Processing streaming response...\n")
+	}
+
+	if resp.StatusCode >= 400 {
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("api error: status %d body %s", resp.StatusCode, clampForLog(string(data)))
+	}
+
+	// Process streaming response
+	var finalContent strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if cfg.Debug {
+			fmt.Fprintf(os.Stderr, "[DEBUG] SSE Line: %s\n", line)
+		}
+
+		// Skip empty lines and SSE event markers
+		if strings.TrimSpace(line) == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		// Extract JSON data
+		dataStr := strings.TrimPrefix(line, "data: ")
+		if dataStr == "[DONE]" {
+			break
+		}
+
+		// Parse the JSON chunk
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
+			if cfg.Debug {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Error parsing SSE chunk: %v\n", err)
+			}
+			continue
+		}
+
+		// Accumulate content
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			finalContent.WriteString(chunk.Choices[0].Delta.Content)
+			fmt.Print(chunk.Choices[0].Delta.Content)
+		}
+
+		// Check for finish reason
+		if len(chunk.Choices) > 0 && chunk.Choices[0].FinishReason != "" {
+			break
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading stream: %v", err)
+	}
+
+	// Create a mock API response with the accumulated content
+	return &APIResponse{
+		Choices: []Choice{
+			{
+				Message: Message{
+					Role:    "assistant",
+					Content: finalContent.String(),
+				},
+				FinishReason: "stop",
+			},
+		},
+	}, nil
 }
